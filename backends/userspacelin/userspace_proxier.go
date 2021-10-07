@@ -21,7 +21,6 @@ import (
 	"net"
 	"reflect"
 
-
 	k8snet "k8s.io/apimachinery/pkg/util/net"
 
 	"strconv"
@@ -37,14 +36,15 @@ import (
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
+
 	// utilfeature "k8s.io/apiserver/pkg/util/feature"
 	servicehelper "k8s.io/cloud-provider/service/helpers"
 	"k8s.io/klog/v2"
+
 	// kubefeatures "k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/proxy/config"
 	"k8s.io/kubernetes/pkg/util/async"
 	"k8s.io/kubernetes/pkg/util/conntrack"
-	iptablesutil "k8s.io/kubernetes/pkg/util/iptables"
 	"sigs.k8s.io/kpng/backends/iptables"
 
 	utilexec "k8s.io/utils/exec"
@@ -210,16 +210,15 @@ var (
 // created, it will keep iptables up to date in the background and will not
 // terminate if a particular iptables call fails.
 
-func NewUserspaceLinux() (*UserspaceLinux, error) {
-	return NewCustomProxier(newProxySocket)
+func NewUserspaceLinux(loadBalancer LoadBalancer, listenIP net.IP, iptables iptables.IptablesInterface, exec utilexec.Interface, pr utilnet.PortRange, syncPeriod, minSyncPeriod, udpIdleTimeout time.Duration, nodePortAddresses []string) (*UserspaceLinux, error) {
+	return NewCustomProxier(loadBalancer, listenIP, iptables, exec, pr, syncPeriod, minSyncPeriod, udpIdleTimeout, nodePortAddresses, newProxySocket)
 }
-
 
 // NewCustomProxier functions similarly to NewProxier, returning a new Proxier
 // for the given LoadBalancer and address.  The new proxier is constructed using
 // the ProxySocket constructor provided, however, instead of constructing the
 // default ProxySockets.
-func NewCustomProxier(makeProxySocket ProxySocketFunc) (*UserspaceLinux, error) {
+func NewCustomProxier(loadBalancer LoadBalancer, listenIP net.IP, iptables iptables.IptablesInterface, exec utilexec.Interface, pr utilnet.PortRange, syncPeriod, minSyncPeriod, udpIdleTimeout time.Duration, nodePortAddresses []string, makeProxySocket ProxySocketFunc) (*UserspaceLinux, error) {
 
 	// If listenIP is given, assume that is the intended host IP.  Otherwise
 	// try to find a suitable host IP address from network interfaces.
@@ -245,11 +244,13 @@ func NewCustomProxier(makeProxySocket ProxySocketFunc) (*UserspaceLinux, error) 
 	klog.V(2).InfoS("Setting proxy IP and initializing iptables", "ip", hostIP)
 
 	// ... finish implementing these functions ...
-	return createProxier(hostIP, iptables, exec, hostIP, proxyPorts, syncPeriod, minSyncPeriod, udpIdleTimeout, makeProxySocket)
+	return createProxier(loadBalancer, hostIP, iptables, exec, hostIP, proxyPorts, syncPeriod, minSyncPeriod, udpIdleTimeout, makeProxySocket)
 }
 
 // createProxier makes a userspace proxier.  It does some iptables actions but it doesn't actually run iptables AS the proxy.
-func createProxier(listenIP net.IP, iptablesInterfaceImpl iptables.IptablesInterface, exec utilexec.Interface, hostIP net.IP, proxyPorts PortAllocator, syncPeriod, minSyncPeriod, udpIdleTimeout time.Duration, makeProxySocket ProxySocketFunc) (*UserspaceLinux, error) {
+func createProxier(loadBalancer LoadBalancer, listenIP net.IP, iptablesInterfaceImpl iptables.IptablesInterface, exec utilexec.Interface, hostIP net.IP, proxyPorts PortAllocator, syncPeriod, minSyncPeriod, udpIdleTimeout time.Duration, makeProxySocket ProxySocketFunc) (*UserspaceLinux, error) {
+	// Hack: since the userspace proxy is old, we don't expect people to need to replace this loadbalancer. so we hardcode it to round_robin.go.
+
 	// convenient to pass nil for tests..
 	if proxyPorts == nil {
 		proxyPorts = newPortAllocator(utilnet.PortRange{})
@@ -264,15 +265,15 @@ func createProxier(listenIP net.IP, iptablesInterfaceImpl iptables.IptablesInter
 		return nil, fmt.Errorf("failed to flush iptables: %v", err)
 	}
 	proxier := &UserspaceLinux{
-		loadBalancer:    loadBalancer,
+		loadBalancer:    loadBalancer, // <----
 		serviceMap:      make(map[iptables.ServicePortName]*ServiceInfo),
-		serviceChanges:  make(map[types.NamespacedName]*serviceChange),
+		serviceChanges:  *ServiceChangeTracker,
 		portMap:         make(map[portMapKey]*portMapValue),
 		syncPeriod:      syncPeriod,
 		minSyncPeriod:   minSyncPeriod,
 		udpIdleTimeout:  udpIdleTimeout,
 		listenIP:        listenIP,
-		iptables:       iptablesInterfaceImpl,
+		iptables:        iptablesInterfaceImpl,
 		hostIP:          hostIP,
 		proxyPorts:      proxyPorts,
 		makeProxySocket: makeProxySocket,
@@ -373,7 +374,7 @@ func (proxier *UserspaceLinux) isInitialized() bool {
 func (proxier *UserspaceLinux) Sync() {
 	proxier.syncRunner.Run()
 }
-
+// this is called sync() in iptables, omg vivek
 func (proxier *UserspaceLinux) syncProxyRules() {
 	start := time.Now()
 	defer func() {
@@ -391,17 +392,20 @@ func (proxier *UserspaceLinux) syncProxyRules() {
 	}
 
 	proxier.serviceChangesLock.Lock()
-	changes := proxier.serviceChanges
-	proxier.serviceChanges = make(map[types.NamespacedName]*serviceChange)
-	proxier.serviceChangesLock.Unlock()
 
-	proxier.mu.Lock()
-	defer proxier.mu.Unlock()
+	oldChanges := proxier.serviceChanges
 
-	klog.V(4).InfoS("userspace proxy: processing service events", "count", len(changes))
-	for _, change := range changes {
-		existingPorts := proxier.mergeService(change.current)
-		proxier.unmergeService(change.previous, existingPorts)
+	// make the "current" service changes a new map and rebuild it...
+	proxier.serviceChanges = &ServiceChangeTracker{}
+	proxier.serviceChanges.lock.Unlock()
+
+	proxier.serviceChanges.Lock()
+	defer proxier.lock.Unlock()
+
+	klog.V(4).InfoS("userspace proxy: processing service events", "count", len(oldChanges))
+	for _, oldChange := range oldChanges {
+		existingPorts := proxier.mergeService(oldChange.current)
+		proxier.unmergeService(oldChange.previous, existingPorts)
 	}
 
 	proxier.localAddrs = GetLocalAddrSet()
@@ -611,8 +615,8 @@ func (proxier *UserspaceLinux) serviceChange(previous, current *v1.Service, deta
 	}
 	klog.V(4).InfoS("Record service change", "action", detail, "svcName", svcName)
 
-	proxier.serviceChangesLock.Lock()
-	defer proxier.serviceChangesLock.Unlock()
+	proxier.serviceChanges.lock.Lock()
+	defer proxier.serviceChanges.lock.Unlock()
 
 	change, exists := proxier.serviceChanges[svcName]
 	if !exists {
@@ -621,7 +625,7 @@ func (proxier *UserspaceLinux) serviceChange(previous, current *v1.Service, deta
 		// depends on the next update/del after a merge, not subsequent
 		// updates.
 		change = &serviceChange{previous: previous}
-		proxier.serviceChanges[svcName] = change
+		proxier.serviceChanges.serviceChanges[svcName] = change
 	}
 
 	// Always use the most current service (or nil) as change.current
@@ -629,7 +633,7 @@ func (proxier *UserspaceLinux) serviceChange(previous, current *v1.Service, deta
 
 	if reflect.DeepEqual(change.previous, change.current) {
 		// collapsed change had no effect
-		delete(proxier.serviceChanges, svcName)
+		delete(proxier.serviceChanges.serviceChanges, svcName)
 	} else if proxier.isInitialized() {
 		// change will have an effect, ask the proxy to sync
 		proxier.syncRunner.Run()
@@ -779,7 +783,7 @@ func (proxier *UserspaceLinux) openOnePortal(portal portal, protocol v1.Protocol
 	// Handle traffic from containers.
 	args := proxier.iptablesContainerPortalArgs(portal.ip, portal.isExternal, false, portal.port, protocol, proxyIP, proxyPort, name)
 	portalAddress := net.JoinHostPort(portal.ip.String(), strconv.Itoa(portal.port))
-	existed, err := proxier.iptables.EnsureRule(iptablesutil.Append, iptablesutil.TableNAT, iptablesContainerPortalChain, args...)
+	existed, err := proxier.iptables.EnsureRule(iptables.Append, iptables.TableNAT, iptablesContainerPortalChain, args...)
 	if err != nil {
 		klog.ErrorS(err, "Failed to install iptables rule for service", "chain", iptablesContainerPortalChain, "servicePortName", name, "args", args)
 		return err

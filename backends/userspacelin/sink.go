@@ -1,37 +1,42 @@
 package userspacelin
 
 import (
+	"time"
+
 	v1 "k8s.io/api/core/v1"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	clientset "k8s.io/client-go/kubernetes"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 
+	"net"
+
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	utilnode "k8s.io/kubernetes/pkg/util/node"
-	"net"
 	componentbaseconfig "k8s.io/component-base/config"
+	utilnode "k8s.io/kubernetes/pkg/util/node"
 
-	"sigs.k8s.io/kpng/localsink"
 	"sync"
+
 	"github.com/spf13/pflag"
 	"k8s.io/utils/exec"
+	"sigs.k8s.io/kpng/localsink"
 
 	"sigs.k8s.io/kpng/backends/iptables"
 
+	utilnet "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/klog/v2"
+	utilexec "k8s.io/utils/exec"
 	"sigs.k8s.io/kpng/localsink/decoder"
 	"sigs.k8s.io/kpng/localsink/filterreset"
 	"sigs.k8s.io/kpng/pkg/api/localnetv1"
-	"k8s.io/klog/v2"
-
 )
 
 type Backend struct {
 	localsink.Config
 }
 
-type Config {
+type Config struct {
 	BindAddress string
 }
 
@@ -113,10 +118,12 @@ func (s *Backend) Setup() {
 	usImpl = make(map[v1.IPFamily]*UserspaceLinux)
 
 	for _, protocol := range []v1.IPFamily{v1.IPv4Protocol, v1.IPv6Protocol} {
-		theProxier, _ := NewUserspaceLinux()
-
+		loadBalancer := NewLoadBalancerRR()
+		iptables := NewIptables()
+		var nodePortAddresses []string
+		// TODO: support ipv6
+		theProxier, _ := NewUserspaceLinux(loadBalancer, net.ParseIP("0.0.0.0"), iptables, exec.New(), utilnet.PortRange{Base: 30000, Size: 2768}, time.Duration(1), time.Duration(1), time.Duration(1), nodePortAddresses)
 		usImpl[protocol] = theProxier
-
 		usImpl[protocol].iptables = NewIPTableExec(exec.New(), Protocol(protocol))
 		usImpl[protocol].serviceChanges = iptables.NewServiceChangeTracker(newServiceInfo, protocol, iptable.recorder)
 		usImpl[protocol].endpointsSynced = NewEndpointChangeTracker(hostname, protocol, iptable.recorder)
@@ -126,34 +133,72 @@ func (s *Backend) Setup() {
 func (s *Backend) Reset() { /* noop, we're wrapped in filterreset */ }
 
 func (s *Backend) Sync() {
-	for _, impl := range IptablesImpl {
+	for _, impl := range usImpl {
 		wg.Add(1)
-		go impl.sync()
+		go impl.syncProxyRules()
 	}
 	wg.Wait()
 }
 
 func (s *Backend) SetService(svc *localnetv1.Service) {
-	for _, impl := range IptablesImpl {
+	for _, impl := range usImpl {
 		impl.serviceChanges.Update(svc)
 	}
 }
 
 func (s *Backend) DeleteService(namespace, name string) {
-	for _, impl := range IptablesImpl {
+	for _, impl := range usImpl {
 		impl.serviceChanges.Delete(namespace, name)
-
 	}
 }
 
+
+// // updatePending updates a pending slice in the cache.
+// func (cache *EndpointsCache) updatePending(svcKey types.NamespacedName, key string, endpoint *localnetv1.Endpoint) bool {
+// 	var esInfoMap *endpointsInfoByName
+// 	var ok bool
+// 	if esInfoMap, ok = cache.trackerByServiceMap[svcKey]; !ok {
+// 		esInfoMap = &endpointsInfoByName{}
+// 		cache.trackerByServiceMap[svcKey] = esInfoMap
+// 	}
+// 	(*esInfoMap)[key] = endpoint
+// 	return true
+// }
+
+
+// name of the endpoint is the same as the service name
 func (s *Backend) SetEndpoint(namespace, serviceName, key string, endpoint *localnetv1.Endpoint) {
-	for _, impl := range IptablesImpl {
-		impl.endpointsChanges.EndpointUpdate(namespace, serviceName, key, endpoint)
+	for _, impl := range usImpl {
+		spn := ServicePortName{ 
+			Namespaced: namespace,
+			Name: serviceName,
+			Port: 8080,
+			Protocol: "TCP",
+		}
+		impl.loadBalancer.services
+		impl.loadBalancer.OnEndpointsAdd(namespace, serviceName, key, endpoint)
 	}
 }
 
 func (s *Backend) DeleteEndpoint(namespace, serviceName, key string) {
-	for _, impl := range IptablesImpl {
-		impl.endpointsChanges.EndpointUpdate(namespace, serviceName, key, nil)
-	}
+	 print("this doesnt work sorry")
 }
+
+
+// 1
+// 2 <-- last connection sent here
+// 3
+// -------------------- rr.OnEndpointsUpdate (1,2,3) (1,2,3,4)
+// 1
+// 2
+// 3 <-- next connection will send here 
+// 4
+// --------------------- rr.OnEndpointsUpdate (1,2,3) (1,2,4)
+// 1
+// 2
+// 4 <-- next connection will send here 
+// ---------------------
+// 1 <-- next connection will send here 
+// 2
+// 4
+
